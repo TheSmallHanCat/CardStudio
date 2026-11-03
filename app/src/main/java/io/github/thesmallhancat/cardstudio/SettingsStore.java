@@ -39,7 +39,8 @@ public final class SettingsStore {
                 JSONObject item = all.optJSONObject(url);
                 if (item == null || !SourcePolicy.isCardArtwork(url)) continue;
                 result.add(new CardEntry(url, item.optString("title", "钱包卡面"),
-                        item.optString("image", ""), item.optBoolean("enabled", true), item.optLong("seen")));
+                        item.optString("image", ""), item.optString("baseImage", ""), item.optString("design", ""),
+                        item.optBoolean("enabled", true), item.optLong("seen")));
             }
             result.sort(Comparator.comparingLong((CardEntry c) -> c.lastSeen).reversed());
             return result;
@@ -68,20 +69,32 @@ public final class SettingsStore {
     }
 
     public void setImage(String url, String imageId, String title) {
+        setArtwork(url, imageId, "", title, "");
+    }
+
+    public void setArtwork(String url, String imageId, String baseImageId, String title, String designJson) {
         if (!SourcePolicy.isCardArtwork(url) || !SourcePolicy.isImageId(imageId))
             throw new IllegalArgumentException("无效的卡面配置");
+        if (!baseImageId.isEmpty() && (!SourcePolicy.isImageId(baseImageId)
+                || imageId.equals(baseImageId) || designJson.length() > 8192))
+            throw new IllegalArgumentException("无效的分层配置");
+        if (!imageFile(imageId).isFile() || (!baseImageId.isEmpty() && !imageFile(baseImageId).isFile()))
+            throw new IllegalArgumentException("卡面图片尚未保存");
         synchronized (LOCK) {
             JSONObject all = load();
             try {
                 JSONObject item = all.optJSONObject(url);
                 if (item == null) item = new JSONObject();
                 String old = item.optString("image");
+                String oldBase = item.optString("baseImage");
                 item.put("title", cleanTitle(title));
                 item.put("namedByUser", true);
                 item.put("image", imageId).put("enabled", true).put("seen", System.currentTimeMillis());
+                item.put("baseImage", baseImageId).put("design", designJson);
                 all.put(url, item);
                 if (!prefs.edit().putString("cards", all.toString()).commit()) throw new IllegalStateException("配置保存失败");
                 if (SourcePolicy.isImageId(old) && !old.equals(imageId)) imageFile(old).setLastModified(System.currentTimeMillis());
+                if (SourcePolicy.isImageId(oldBase) && !oldBase.equals(baseImageId)) imageFile(oldBase).setLastModified(System.currentTimeMillis());
             } catch (JSONException e) { throw new IllegalStateException(e); }
         }
         notifyConfig();
@@ -110,9 +123,13 @@ public final class SettingsStore {
             JSONObject item = all.optJSONObject(url);
             if (item == null) return;
             String old = item.optString("image");
+            String oldBase = item.optString("baseImage");
             item.remove("image");
+            item.remove("baseImage");
+            item.remove("design");
             if (!prefs.edit().putString("cards", all.toString()).commit()) throw new IllegalStateException("配置保存失败");
             if (SourcePolicy.isImageId(old)) imageFile(old).setLastModified(System.currentTimeMillis());
+            if (SourcePolicy.isImageId(oldBase)) imageFile(oldBase).setLastModified(System.currentTimeMillis());
         }
         notifyConfig();
     }
@@ -173,7 +190,10 @@ public final class SettingsStore {
         File[] files = new File(context.getFilesDir(), "artwork").listFiles();
         if (files == null) return;
         Set<String> active = new HashSet<>();
-        for (CardEntry card : cards()) if (card.hasCustomImage()) active.add(card.imageId);
+        for (CardEntry card : cards()) {
+            if (card.hasCustomImage()) active.add(card.imageId);
+            if (SourcePolicy.isImageId(card.baseImageId)) active.add(card.baseImageId);
+        }
         int inspected = 0;
         for (File file : files) {
             if (++inspected > 128) break;

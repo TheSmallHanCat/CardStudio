@@ -7,8 +7,8 @@ android {
         applicationId = "io.github.thesmallhancat.cardstudio"
         minSdk = 28
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0-alpha01"
+        versionCode = 2
+        versionName = "0.1.0-alpha02"
     }
     buildTypes {
         release {
@@ -20,10 +20,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     testOptions { unitTests.isReturnDefaultValues = true }
+    buildFeatures { buildConfig = true }
 }
 
 dependencies {
     compileOnly("io.github.libxposed:api:101.0.1")
     implementation("io.github.libxposed:service:101.0.0")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

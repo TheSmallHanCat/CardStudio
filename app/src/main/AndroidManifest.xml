@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
-    <queries><package android:name="com.finshell.wallet" /></queries>
+    <queries>
+        <package android:name="com.finshell.wallet" />
+        <package android:name="com.zhizi42.diymiuicard" />
+    </queries>
     <application
         android:allowBackup="false"
         android:label="卡面工坊"

@@ -60,6 +60,7 @@ public final class MainActivity extends Activity {
     private static final Object ACTIVE_ACTIVITY_LOCK = new Object();
     private static WeakReference<MainActivity> activeActivity = new WeakReference<>(null);
     private static final int REQUEST_IMAGE = 4201;
+    private static final int REQUEST_LOGO = 4202;
     private static final int INK = Color.rgb(32, 37, 39);
     private static final int MUTED = Color.rgb(100, 108, 113);
     private static final int INDIGO = Color.rgb(64, 92, 228);
@@ -68,6 +69,7 @@ public final class MainActivity extends Activity {
     private static final int SOFT_GREEN = Color.rgb(70, 128, 96);
 
     private SettingsStore store;
+    private FrameLibrary frameLibrary;
     private ExecutorService imageExecutor;
     private Handler mainHandler;
     private LinearLayout root;
@@ -79,9 +81,20 @@ public final class MainActivity extends Activity {
     private List<CardEntry> cards = new ArrayList<>();
     private ArtworkEditorView editorView;
     private Bitmap selectedBitmap;
+    private ArtworkDesign editorDesign;
+    private FrameLibrary.Logos editorLogos;
+    private LinearLayout editorControls;
+    private LinearLayout templateOptions;
+    private LinearLayout editorTabs;
+    private int editorTarget = ArtworkDesign.BACKGROUND;
+    private boolean editorMigratedLegacy;
+    private boolean logosLoading;
+    private boolean logosLoadFailed;
+    private long logosGeneration;
     private long editorGeneration;
     private boolean saving;
     private Bitmap savingSnapshot;
+    private Bitmap savingBaseSnapshot;
     private Button activeSaveButton;
     private Button activeTitleButton;
     private Button activeRestoreButton;
@@ -96,6 +109,7 @@ public final class MainActivity extends Activity {
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
         store = new SettingsStore(this);
+        frameLibrary = new FrameLibrary(this);
         imageExecutor = Executors.newSingleThreadExecutor();
         mainHandler = new Handler(Looper.getMainLooper());
         if (state != null) {
@@ -189,7 +203,10 @@ public final class MainActivity extends Activity {
 
     private void renderPage(int index) {
         content.removeAllViews();
+        if (!editorMode) closeEditorLogos();
         editorView = null;
+        editorControls = null;
+        editorTabs = null;
         activeSaveButton = null;
         activeTitleButton = null;
         activeRestoreButton = null;
@@ -208,6 +225,15 @@ public final class MainActivity extends Activity {
         scroll.addView(body, new ScrollView.LayoutParams(-1, -2));
         content.addView(scroll, new FrameLayout.LayoutParams(-1, -1));
         renderBottomActions();
+    }
+
+    private void closeEditorLogos() {
+        logosGeneration++;
+        logosLoading = false;
+        logosLoadFailed = false;
+        FrameLibrary.Logos old = editorLogos;
+        editorLogos = null;
+        if (old != null) old.close();
     }
 
     private void renderArtwork(LinearLayout body) {
@@ -288,6 +314,9 @@ public final class MainActivity extends Activity {
             activeRestoreButton = restore;
             restore.setOnClickListener(v -> confirmRestore(card));
             body.addView(restore, margin(-12, 2, 0, 0));
+            Button edit = textAction("编辑模板");
+            edit.setOnClickListener(v -> openExistingEditor(card));
+            body.addView(edit, margin(-12, 0, 0, 0));
         }
     }
 
@@ -316,9 +345,14 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQUEST_IMAGE || resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        if ((requestCode != REQUEST_IMAGE && requestCode != REQUEST_LOGO)
+                || resultCode != RESULT_OK || data == null || data.getData() == null) return;
         if (isSaveBusy()) {
             Toast.makeText(this, "正在保存卡面，请稍候", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (requestCode == REQUEST_LOGO) {
+            handleLogoResult(data.getData());
             return;
         }
         final String targetUrl = selectedUrl;
@@ -328,7 +362,8 @@ public final class MainActivity extends Activity {
         imageExecutor.execute(() -> {
             Bitmap decoded = decodeUri(uri);
             mainHandler.post(() -> {
-                if (isFinishingOrDestroyed() || isSaveBusy() || generation != editorGeneration || !targetUrl.equals(selectedUrl)) {
+                if (isFinishingOrDestroyed() || isSaveBusy() || generation != editorGeneration
+                        || !targetUrl.equals(selectedUrl)) {
                     if (decoded != null && !decoded.isRecycled()) decoded.recycle();
                     return;
                 }
@@ -336,9 +371,14 @@ public final class MainActivity extends Activity {
                     Toast.makeText(this, "图片读取失败，请选择另一张图片", Toast.LENGTH_SHORT).show();
                     return;
                 }
-                showEditor(targetUrl, decoded);
+                if (editorMode && targetUrl.equals(editorTargetUrl)) {
+                    replaceEditorBackground(decoded);
+                } else {
+                    showEditor(targetUrl, decoded);
+                }
             });
         });
+        return;
     }
 
     private void showEditor(String targetUrl, Bitmap bitmap) {
@@ -347,12 +387,12 @@ public final class MainActivity extends Activity {
             if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
             return;
         }
-        selectedBitmap = bitmap;
-        editorTargetUrl = targetUrl;
-        editorSaveVersion = SAVE_VERSION;
-        page = 0;
-        editorMode = true;
-        renderPage(0);
+        ArtworkDesign design = new ArtworkDesign();
+        if (card.hasEditableDesign()) {
+            try { design = ArtworkDesignJson.decode(card.designJson); }
+            catch (Exception ignored) { }
+        }
+        startEditor(targetUrl, bitmap, design);
     }
 
     private void renderEditor(LinearLayout body) {
@@ -362,27 +402,387 @@ public final class MainActivity extends Activity {
         body.addView(hint, margin(0, 4, 0, 12));
         editorView = new ArtworkEditorView(this);
         editorView.setImage(selectedBitmap);
+        editorView.setDesign(editorDesign == null ? new ArtworkDesign() : editorDesign.copy());
+        editorView.setEditTarget(editorTarget);
         AspectFrameLayout editorFrame = new AspectFrameLayout(this);
         editorFrame.setBackground(round(0xFFE8E8E3, 16));
         editorFrame.addView(editorView, new FrameLayout.LayoutParams(-1, -1));
         body.addView(editorFrame, fixedHeightMargin(0, 0, 0, 0, dp(210)));
-        LinearLayout zoomRow = row();
-        zoomRow.addView(text("缩放", 14, MUTED), contentWrap());
-        SeekBar zoom = new SeekBar(this);
-        zoom.setMax(20);
-        zoom.setProgress(0);
-        TextView value = text("1.0×", 13, MUTED);
-        zoom.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
-                if (editorView != null) editorView.setZoom(1f + progress / 10f);
-                value.setText(String.format(Locale.US, "%.1f×", 1f + progress / 10f));
+        if (editorLogos != null) editorView.setLogos(editorLogos.primary, editorLogos.union);
+
+        editorTabs = row();
+        editorTabs.setPadding(0, dp(10), 0, dp(2));
+        addEditorTab("背景", ArtworkDesign.BACKGROUND);
+        addEditorTab("主标志", ArtworkDesign.PRIMARY_LOGO);
+        addEditorTab("联合标志", ArtworkDesign.UNION_LOGO);
+        addEditorTab("文字", ArtworkDesign.TEXT);
+        body.addView(editorTabs, new LinearLayout.LayoutParams(-1, dp(58)));
+
+        editorControls = column();
+        body.addView(editorControls, wrap());
+        renderEditorControls();
+        addTemplateRow(body);
+    }
+
+    private void addEditorTab(String label, int target) {
+        TextView tab = text(label, 13, target == editorTarget ? INK : MUTED);
+        tab.setGravity(Gravity.CENTER);
+        tab.setSingleLine(true);
+        tab.setBackground(target == editorTarget ? outlineRound(0x143F5CE4, 0x55405CE4, 10) : round(Color.TRANSPARENT, 10));
+        tab.setOnClickListener(v -> {
+            if (editorTarget == ArtworkDesign.TEXT) syncTextLayer();
+            editorTarget = target;
+            if (editorView != null) editorView.setEditTarget(target);
+            for (int i = 0; i < editorTabs.getChildCount(); i++) {
+                TextView item = (TextView) editorTabs.getChildAt(i);
+                int itemTarget = i;
+                item.setTextColor(itemTarget == editorTarget ? INK : MUTED);
+                item.setBackground(itemTarget == editorTarget ? outlineRound(0x143F5CE4, 0x55405CE4, 10) : round(Color.TRANSPARENT, 10));
             }
-            public void onStartTrackingTouch(SeekBar bar) { }
-            public void onStopTrackingTouch(SeekBar bar) { }
+            renderEditorControls();
         });
-        zoomRow.addView(zoom, new LinearLayout.LayoutParams(0, dp(48), 1));
-        zoomRow.addView(value, contentMargin(8, 0, 0, 0));
-        body.addView(zoomRow, margin(0, 8, 0, 0));
+        editorTabs.addView(tab, new LinearLayout.LayoutParams(0, dp(44), 1));
+    }
+
+    private void renderEditorControls() {
+        if (editorControls == null) return;
+        editorControls.removeAllViews();
+        if (editorView == null) return;
+        if (editorTarget == ArtworkDesign.BACKGROUND) {
+            Button choose = subtleButton("更换背景图片");
+            choose.setOnClickListener(v -> chooseEditorBackground());
+            editorControls.addView(choose, wrap());
+            editorControls.addView(text("背景图可拖动和缩放，其他图层会保留。", 13, MUTED), margin(0, 7, 0, 0));
+            editorControls.addView(backgroundZoomRow(), margin(0, 2, 0, 0));
+            return;
+        }
+        if (editorTarget == ArtworkDesign.TEXT) {
+            EditText title = compactEdit("标题", editorView.getDesign().text.title);
+            EditText subtitle = compactEdit("副标题", editorView.getDesign().text.subtitle);
+            editorControls.addView(title, wrap());
+            editorControls.addView(subtitle, margin(0, 8, 0, 0));
+            LinearLayout colors = row();
+            Button white = subtleButton("白色文字");
+            white.setOnClickListener(v -> editorView.setText(title.getText().toString(), subtitle.getText().toString(), Color.WHITE));
+            colors.addView(white, new LinearLayout.LayoutParams(0, dp(44), 1));
+            Button dark = subtleButton("深色文字");
+            dark.setOnClickListener(v -> editorView.setText(title.getText().toString(), subtitle.getText().toString(), INK));
+            colors.addView(dark, contentMargin(8, 0, 0, 0));
+            editorControls.addView(colors, margin(0, 8, 0, 0));
+            addLayerSliders(editorControls, ArtworkDesign.TEXT, editorView.getDesign().text.enabled,
+                    layerScale(ArtworkDesign.TEXT), layerOpacity(ArtworkDesign.TEXT));
+            return;
+        }
+        ArtworkDesign.Layer layer = editorTarget == ArtworkDesign.PRIMARY_LOGO
+                ? editorView.getDesign().primary : editorView.getDesign().union;
+        addLayerSliders(editorControls, editorTarget, layer.enabled, layerScale(editorTarget), layerOpacity(editorTarget));
+        if (editorTarget == ArtworkDesign.PRIMARY_LOGO) {
+            Button importLogo = subtleButton("导入透明 PNG 标志");
+            importLogo.setOnClickListener(v -> chooseLogo());
+            editorControls.addView(importLogo, margin(0, 10, 0, 0));
+        } else {
+            editorControls.addView(text("联合标志跟随所选交通模板。", 13, MUTED), margin(0, 8, 0, 0));
+        }
+    }
+
+    private EditText compactEdit(String hint, String value) {
+        EditText input = new EditText(this);
+        input.setHint(hint);
+        input.setText(value == null ? "" : value);
+        input.setTextSize(14);
+        input.setSingleLine(true);
+        input.setMinHeight(dp(48));
+        input.setMinimumHeight(dp(48));
+        input.setTextColor(INK);
+        input.setPadding(dp(12), 0, dp(12), 0);
+        input.setBackground(round(0xFFF0EFEC, 10));
+        input.setOnFocusChangeListener((v, focused) -> { if (!focused) syncTextLayer(); });
+        return input;
+    }
+
+    private void syncTextLayer() {
+        if (editorControls == null || editorControls.getChildCount() < 2 || editorView == null
+                || !(editorControls.getChildAt(0) instanceof EditText)
+                || !(editorControls.getChildAt(1) instanceof EditText)) return;
+        EditText title = (EditText) editorControls.getChildAt(0);
+        EditText subtitle = (EditText) editorControls.getChildAt(1);
+        boolean enabled = editorView.getDesign().text.enabled;
+        editorView.setText(title.getText().toString(), subtitle.getText().toString(), editorView.getDesign().text.color);
+        editorView.setLayerEnabled(ArtworkDesign.TEXT, enabled);
+    }
+
+    private float layerScale(int target) {
+        editorView.setEditTarget(target);
+        ArtworkDesign.Layer layer = target == ArtworkDesign.TEXT ? editorView.getDesign().text
+                : target == ArtworkDesign.PRIMARY_LOGO ? editorView.getDesign().primary : editorView.getDesign().union;
+        return layer.width;
+    }
+
+    private float layerOpacity(int target) {
+        editorView.setEditTarget(target);
+        ArtworkDesign.Layer layer = target == ArtworkDesign.TEXT ? editorView.getDesign().text
+                : target == ArtworkDesign.PRIMARY_LOGO ? editorView.getDesign().primary : editorView.getDesign().union;
+        return layer.opacity;
+    }
+
+    private void addLayerSliders(LinearLayout parent, int target, boolean enabled, float scale, float opacity) {
+        Switch visible = new Switch(this);
+        visible.setChecked(enabled);
+        LinearLayout visibleRow = row();
+        visibleRow.addView(text("显示图层", 14, INK), new LinearLayout.LayoutParams(0, dp(48), 1));
+        visible.setOnCheckedChangeListener((button, checked) -> { if (editorView != null) editorView.setLayerEnabled(target, checked); });
+        visibleRow.addView(visible, new LinearLayout.LayoutParams(dp(56), dp(48)));
+        parent.addView(visibleRow, wrap());
+        parent.addView(sliderRow("大小", scale, target, true), margin(0, 2, 0, 0));
+        parent.addView(sliderRow("透明度", opacity, target, false), margin(0, 2, 0, 0));
+    }
+
+    private LinearLayout sliderRow(String label, float value, int target, boolean scale) {
+        LinearLayout line = row();
+        line.addView(text(label, 13, MUTED), new LinearLayout.LayoutParams(dp(48), dp(48)));
+        SeekBar bar = new SeekBar(this);
+        bar.setMax(100);
+        float min = scale && target == ArtworkDesign.TEXT ? ArtworkDesign.MIN_TEXT_WIDTH : ArtworkDesign.MIN_LOGO_WIDTH;
+        float max = scale && target == ArtworkDesign.TEXT ? ArtworkDesign.MAX_TEXT_WIDTH : ArtworkDesign.MAX_LOGO_WIDTH;
+        bar.setProgress(Math.round((scale ? (value - min) / (max - min) : value) * 100f));
+        TextView readout = text(String.format(Locale.US, "%d%%", Math.round((scale ? value / max : value) * 100f)), 12, MUTED);
+        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(SeekBar b, int progress, boolean fromUser) {
+                float next = scale ? min + (max - min) * progress / 100f : progress / 100f;
+                if (editorView != null) {
+                    editorView.setEditTarget(target);
+                    if (scale) editorView.setLayerScale(next); else editorView.setLayerOpacity(next);
+                }
+                readout.setText(String.format(Locale.US, "%d%%", Math.round((scale ? next / max : next) * 100f)));
+            }
+            public void onStartTrackingTouch(SeekBar b) { }
+            public void onStopTrackingTouch(SeekBar b) { }
+        });
+        line.addView(bar, new LinearLayout.LayoutParams(0, dp(48), 1));
+        line.addView(readout, contentMargin(8, 0, 0, 0));
+        return line;
+    }
+
+    private LinearLayout backgroundZoomRow() {
+        LinearLayout line = row();
+        line.addView(text("缩放", 13, MUTED), new LinearLayout.LayoutParams(dp(48), dp(48)));
+        SeekBar bar = new SeekBar(this);
+        bar.setMax(20);
+        int progress = Math.round((editorView.getZoom() - 1f) * 10f);
+        bar.setProgress(Math.max(0, Math.min(20, progress)));
+        TextView readout = text(String.format(Locale.US, "%.1f×", editorView.getZoom()), 12, MUTED);
+        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(SeekBar b, int value, boolean fromUser) {
+                float zoom = 1f + value / 10f;
+                editorView.setZoom(zoom);
+                readout.setText(String.format(Locale.US, "%.1f×", zoom));
+            }
+            public void onStartTrackingTouch(SeekBar b) { }
+            public void onStopTrackingTouch(SeekBar b) { }
+        });
+        line.addView(bar, new LinearLayout.LayoutParams(0, dp(48), 1));
+        line.addView(readout, contentMargin(8, 0, 0, 0));
+        return line;
+    }
+
+    private void addTemplateRow(LinearLayout body) {
+        LinearLayout templates = row();
+        templateOptions = templates;
+        templates.setPadding(0, dp(10), 0, dp(2));
+        populateTemplateOptions();
+        HorizontalScrollView scroll = new HorizontalScrollView(this);
+        scroll.setHorizontalScrollBarEnabled(false);
+        scroll.addView(templates, new HorizontalScrollView.LayoutParams(-2, dp(52)));
+        body.addView(scroll, new LinearLayout.LayoutParams(-1, dp(54)));
+    }
+
+    private void addTemplateButton(LinearLayout row, String title, String id) {
+        Button button = textAction(title);
+        button.setMinWidth(dp(64));
+        button.setMinimumWidth(dp(64));
+        button.setTag(id);
+        boolean selected = editorView != null && id.equals(editorView.getDesign().templateId);
+        button.setTextColor(selected ? INDIGO : MUTED);
+        button.setBackground(touchRound(selected ? 0x16405CE4 : Color.TRANSPARENT, 0x18000000, 10));
+        button.setOnClickListener(v -> applyTemplate(id));
+        row.addView(button, contentWrap());
+    }
+
+    private void populateTemplateOptions() {
+        if (templateOptions == null) return;
+        templateOptions.removeAllViews();
+        addTemplateButton(templateOptions, "无", "none");
+        List<FrameLibrary.Preset> presets = frameLibrary.availablePresets();
+        for (FrameLibrary.Preset preset : presets) addTemplateButton(templateOptions, preset.title, preset.id);
+        if (presets.isEmpty()) {
+            Button importButton = textAction("导入交通模板");
+            importButton.setOnClickListener(v -> importLegacyTemplates());
+            templateOptions.addView(importButton, contentWrap());
+        }
+    }
+
+    private void applyTemplate(String id) {
+        if (editorView == null || isSaveBusy()) return;
+        if (editorTarget == ArtworkDesign.TEXT) syncTextLayer();
+        ArtworkDesign next = editorView.getDesign();
+        frameLibrary.applyPreset(next, id);
+        editorView.setDesign(next);
+        editorDesign = next.copy();
+        loadEditorLogos(next);
+        renderEditorControls();
+        populateTemplateOptions();
+    }
+
+    private void chooseEditorBackground() {
+        if (isSaveBusy() || editorTargetUrl == null) return;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/*");
+        startActivityForResult(intent, REQUEST_IMAGE);
+    }
+
+    private void chooseLogo() {
+        if (isSaveBusy() || editorTargetUrl == null) return;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("image/png");
+        startActivityForResult(intent, REQUEST_LOGO);
+    }
+
+    private void openExistingEditor(CardEntry card) {
+        if (isSaveBusy()) {
+            Toast.makeText(this, "正在保存卡面，请稍候", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final long generation = ++editorGeneration;
+        final String targetUrl = card.url;
+        imageExecutor.execute(() -> {
+            ArtworkDesign design = new ArtworkDesign();
+            Bitmap background = null;
+            boolean migrated = false;
+            try {
+                if (card.hasEditableDesign()) {
+                    design = ArtworkDesignJson.decode(card.designJson);
+                    background = decodeFile(store.imageFile(card.baseImageId));
+                } else if (card.hasCustomImage()) {
+                    background = decodeFile(store.imageFile(card.imageId));
+                    migrated = true;
+                }
+            } catch (Exception ignored) { }
+            ArtworkDesign finalDesign = design == null ? new ArtworkDesign() : design;
+            Bitmap finalBackground = background;
+            boolean finalMigrated = migrated;
+            mainHandler.post(() -> {
+                if (isFinishingOrDestroyed() || isSaveBusy() || generation != editorGeneration
+                        || !targetUrl.equals(selectedUrl)) {
+                    if (finalBackground != null && !finalBackground.isRecycled()) finalBackground.recycle();
+                    return;
+                }
+                if (finalBackground == null) {
+                    Toast.makeText(this, "原卡面读取失败，请先选择背景图片", Toast.LENGTH_SHORT).show();
+                    chooseImage(targetUrl);
+                    return;
+                }
+                editorMigratedLegacy = finalMigrated;
+                if (finalMigrated) Toast.makeText(this, "旧版卡面将作为背景重新编辑", Toast.LENGTH_SHORT).show();
+                startEditor(targetUrl, finalBackground, finalDesign);
+            });
+        });
+    }
+
+    private void startEditor(String targetUrl, Bitmap background, ArtworkDesign design) {
+        selectedBitmap = background;
+        editorDesign = design == null ? new ArtworkDesign() : design.copy();
+        editorTargetUrl = targetUrl;
+        editorSaveVersion = SAVE_VERSION;
+        page = 0;
+        editorMode = true;
+        editorTarget = ArtworkDesign.BACKGROUND;
+        loadEditorLogos(editorDesign);
+        renderPage(0);
+    }
+
+    private void replaceEditorBackground(Bitmap bitmap) {
+        if (editorView == null || bitmap == null) return;
+        Bitmap old = selectedBitmap;
+        editorView.setImage(bitmap);
+        selectedBitmap = bitmap;
+        if (old != null && old != bitmap && !old.isRecycled()) old.recycle();
+    }
+
+    private void loadEditorLogos(ArtworkDesign design) {
+        final long logoVersion = ++logosGeneration;
+        final ArtworkDesign snapshot = design == null ? new ArtworkDesign() : design.copy();
+        logosLoading = true;
+        logosLoadFailed = false;
+        if (editorView != null) {
+            FrameLibrary.Logos old = editorLogos;
+            editorLogos = null;
+            editorView.setLogos(null, null);
+            if (old != null) old.close();
+        }
+        if (activeSaveButton != null) activeSaveButton.setEnabled(false);
+        imageExecutor.execute(() -> {
+            FrameLibrary.Logos logos = null;
+            String failure = null;
+            try { logos = frameLibrary.loadLogos(snapshot); }
+            catch (RuntimeException ex) { failure = ex.getMessage(); }
+            final FrameLibrary.Logos loaded = logos;
+            final String error = failure;
+            mainHandler.post(() -> {
+                if (isFinishingOrDestroyed() || !editorMode
+                        || editorView == null || logoVersion != logosGeneration) {
+                    if (loaded != null) loaded.close();
+                    return;
+                }
+                if (loaded == null) {
+                    logosLoading = false;
+                    logosLoadFailed = true;
+                    if (activeSaveButton != null) activeSaveButton.setEnabled(false);
+                    editorView.setLogos(null, null);
+                    Toast.makeText(this, error == null ? "模板素材读取失败，请重新导入模板" : "模板素材读取失败", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                editorView.setLogos(loaded.primary, loaded.union);
+                FrameLibrary.Logos old = editorLogos;
+                editorLogos = loaded;
+                logosLoading = false;
+                logosLoadFailed = false;
+                if (activeSaveButton != null) activeSaveButton.setEnabled(!isSaveBusy());
+                if (old != null) old.close();
+            });
+        });
+    }
+
+    private void handleLogoResult(Uri uri) {
+        if (!editorMode || editorView == null || editorTargetUrl == null) return;
+        final long generation = ++editorGeneration;
+        final String protectedLogoId = editorView.getDesign().customLogoId;
+        imageExecutor.execute(() -> {
+            Bitmap decoded = decodeUri(uri);
+            if (decoded == null) {
+                mainHandler.post(() -> Toast.makeText(this, "透明 PNG 读取失败，请重试", Toast.LENGTH_SHORT).show());
+                return;
+            }
+            try {
+                String logoId = frameLibrary.saveCustomLogo(decoded, protectedLogoId);
+                mainHandler.post(() -> {
+                    if (isFinishingOrDestroyed() || isSaveBusy() || generation != editorGeneration
+                            || !editorMode || editorView == null) return;
+                    ArtworkDesign next = editorView.getDesign();
+                    next.customLogoId = logoId;
+                    next.primary.enabled = true;
+                    editorView.setDesign(next);
+                    editorDesign = next.copy();
+                    loadEditorLogos(next);
+                    Toast.makeText(this, "主标志已导入", Toast.LENGTH_SHORT).show();
+                });
+            } catch (Exception ex) {
+                mainHandler.post(() -> Toast.makeText(this, "标志保存失败，请重试", Toast.LENGTH_SHORT).show());
+            } finally {
+                if (!decoded.isRecycled()) decoded.recycle();
+            }
+        });
     }
 
     private void cancelEditor() {
@@ -467,6 +867,7 @@ public final class MainActivity extends Activity {
             actions.addView(cancel, new LinearLayout.LayoutParams(0, dp(48), 1));
             Button save = primaryButton("保存卡面");
             activeSaveButton = save;
+            save.setEnabled(!logosLoading && !logosLoadFailed && !isSaveBusy());
             save.setOnClickListener(v -> saveArtwork(editorTargetUrl));
             LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(0, dp(48), 1);
             saveParams.leftMargin = dp(10);
@@ -496,7 +897,16 @@ public final class MainActivity extends Activity {
             Toast.makeText(this, "正在保存卡面，请稍候", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (editorView == null || editorView.getImage() == null || !targetUrl.equals(selectedUrl)) {
+        if (logosLoading) {
+            Toast.makeText(this, "正在载入模板素材，请稍候", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (logosLoadFailed) {
+            Toast.makeText(this, "模板素材读取失败，请重新导入或选择无模板", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (editorView == null || editorView.getImage() == null || !targetUrl.equals(selectedUrl)
+                || !editorMode || !targetUrl.equals(editorTargetUrl)) {
             Toast.makeText(this, "请先选择一张图片", Toast.LENGTH_SHORT).show();
             return;
         }
@@ -508,44 +918,70 @@ public final class MainActivity extends Activity {
         }
         saving = true;
         setOperationControlsEnabled(false);
-        Bitmap snapshot;
-        try { snapshot = editorView.exportBitmap(); }
-        catch (RuntimeException ex) {
+        syncTextLayer();
+        Bitmap snapshot = null;
+        Bitmap baseSnapshot = null;
+        try {
+            snapshot = editorView.exportBitmap();
+            baseSnapshot = editorView.exportBackgroundBitmap();
+        }
+        catch (RuntimeException | OutOfMemoryError ex) {
+            if (snapshot != null && !snapshot.isRecycled()) snapshot.recycle();
+            if (baseSnapshot != null && !baseSnapshot.isRecycled()) baseSnapshot.recycle();
             PROCESS_SAVE_BUSY.set(false);
             saving = false;
             setOperationControlsEnabled(true);
             Toast.makeText(this, "无法生成图片预览", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (snapshot == null) {
+        if (snapshot == null || baseSnapshot == null) {
+            if (snapshot != null && !snapshot.isRecycled()) snapshot.recycle();
+            if (baseSnapshot != null && !baseSnapshot.isRecycled()) baseSnapshot.recycle();
             PROCESS_SAVE_BUSY.set(false);
             saving = false;
             setOperationControlsEnabled(true);
             Toast.makeText(this, "无法生成图片预览", Toast.LENGTH_SHORT).show();
             return;
         }
+        final Bitmap finalSnapshot = snapshot;
+        final Bitmap finalBaseSnapshot = baseSnapshot;
         final String imageId = UUID.randomUUID().toString().toLowerCase(Locale.US) + ".jpg";
+        final String baseImageId = UUID.randomUUID().toString().toLowerCase(Locale.US) + ".jpg";
         CardEntry currentCard = findCard(targetUrl);
         final String title = currentCard == null || currentCard.title == null ? "我的卡面" : currentCard.title.trim();
-        savingSnapshot = snapshot;
+        final String designJson;
+        try { designJson = ArtworkDesignJson.encode(editorView.getDesign()); }
+        catch (RuntimeException ex) {
+            if (!snapshot.isRecycled()) snapshot.recycle();
+            if (!baseSnapshot.isRecycled()) baseSnapshot.recycle();
+            PROCESS_SAVE_BUSY.set(false);
+            saving = false;
+            setOperationControlsEnabled(true);
+            Toast.makeText(this, "无法读取图层设置", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        savingSnapshot = finalSnapshot;
+        savingBaseSnapshot = finalBaseSnapshot;
         editorSaveVersion = SAVE_VERSION;
         final SettingsStore saveStore = store;
         try {
             imageExecutor.execute(() -> {
                 File file = null;
+                File baseFile = null;
                 boolean success = false;
                 try {
                     file = saveStore.imageFile(imageId);
-                    try (FileOutputStream output = new FileOutputStream(file)) {
-                        if (!snapshot.compress(Bitmap.CompressFormat.JPEG, 92, output)) throw new IllegalStateException("编码失败");
-                        output.flush();
-                    }
-                    saveStore.setImage(targetUrl, imageId, title);
-                    success = file.isFile();
+                    baseFile = saveStore.imageFile(baseImageId);
+                    writeJpeg(finalSnapshot, file);
+                    writeJpeg(finalBaseSnapshot, baseFile);
+                    saveStore.setArtwork(targetUrl, imageId, baseImageId, title, designJson);
+                    success = file.isFile() && baseFile.isFile();
                 } catch (Exception ex) {
                     if (file != null) file.delete();
+                    if (baseFile != null) baseFile.delete();
                 } finally {
-                    if (!snapshot.isRecycled()) snapshot.recycle();
+                    if (!finalSnapshot.isRecycled()) finalSnapshot.recycle();
+                    if (!finalBaseSnapshot.isRecycled()) finalBaseSnapshot.recycle();
                     LAST_SAVE_SUCCESS = success;
                     SAVE_VERSION++;
                     PROCESS_SAVE_BUSY.set(false);
@@ -554,11 +990,20 @@ public final class MainActivity extends Activity {
             });
         } catch (RuntimeException ex) {
             PROCESS_SAVE_BUSY.set(false);
-            if (!snapshot.isRecycled()) snapshot.recycle();
+            if (!finalSnapshot.isRecycled()) finalSnapshot.recycle();
+            if (!finalBaseSnapshot.isRecycled()) finalBaseSnapshot.recycle();
             savingSnapshot = null;
+            savingBaseSnapshot = null;
             saving = false;
             setOperationControlsEnabled(true);
             Toast.makeText(this, "保存任务无法启动，请重试", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private static void writeJpeg(Bitmap bitmap, File target) throws IOException {
+        try (FileOutputStream output = new FileOutputStream(target)) {
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 92, output)) throw new IOException("编码失败");
+            output.flush();
         }
     }
 
@@ -703,12 +1148,40 @@ public final class MainActivity extends Activity {
         });
         body.addView(helpToggle, wrap());
         body.addView(help, margin(0, 0, 0, 10));
+        Button importLegacy = textAction("导入旧版交通模板");
+        importLegacy.setOnClickListener(v -> importLegacyTemplates());
+        body.addView(importLegacy, margin(-12, 0, 0, 0));
 
         body.addView(sectionLabel("关于"), margin(0, 18, 0, 4));
-        body.addView(text("0.1.0-alpha01 · 免费开源，仅修改图片。", 14, MUTED), wrap());
+        body.addView(text(BuildConfig.VERSION_NAME + " · 免费开源，仅修改图片。", 14, MUTED), wrap());
         Button licenses = textAction("开源许可");
         licenses.setOnClickListener(v -> showLicenses());
         body.addView(licenses, margin(-12, 6, 0, 0));
+    }
+
+    private void importLegacyTemplates() {
+        if (isSaveBusy()) {
+            Toast.makeText(this, "正在保存卡面，请稍候", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        FrameLibrary library = frameLibrary;
+        imageExecutor.execute(() -> {
+            int count = 0;
+            String error = null;
+            try { count = library.importLegacyTemplates(); }
+            catch (Exception ex) { error = ex.getMessage(); }
+            final int imported = count;
+            final String failure = error;
+            mainHandler.post(() -> {
+                if (isFinishingOrDestroyed()) return;
+                if (failure != null && !failure.trim().isEmpty()) {
+                    Toast.makeText(this, "导入失败：" + failure, Toast.LENGTH_LONG).show();
+                } else {
+                    Toast.makeText(this, imported > 0 ? "已导入旧版交通模板" : "旧版模板已是最新", Toast.LENGTH_SHORT).show();
+                    if (editorMode) populateTemplateOptions();
+                }
+            });
+        });
     }
 
     private void settingsRow(LinearLayout parent, String label, String value) {
@@ -760,7 +1233,7 @@ public final class MainActivity extends Activity {
     }
 
     private void copyDiagnostics() {
-        String value = "CardStudio 0.1.0-alpha01\n"
+        String value = "CardStudio " + BuildConfig.VERSION_NAME + "\n"
                 + "walletVersion=" + redact(store.walletVersion()) + "\n"
                 + "hookCount=" + store.hookCount() + "\n"
                 + "lastConnected=" + formatTime(store.lastConnected()) + "\n"
@@ -803,7 +1276,7 @@ public final class MainActivity extends Activity {
     }
 
     private void setOperationControlsEnabled(boolean enabled) {
-        if (activeSaveButton != null) activeSaveButton.setEnabled(enabled);
+        if (activeSaveButton != null) activeSaveButton.setEnabled(enabled && !logosLoading && !logosLoadFailed);
         if (activeTitleButton != null) activeTitleButton.setEnabled(enabled);
         if (activeRestoreButton != null) activeRestoreButton.setEnabled(enabled);
         if (activeChooseButton != null) activeChooseButton.setEnabled(enabled);
@@ -848,6 +1321,7 @@ public final class MainActivity extends Activity {
         if (isFinishingOrDestroyed()) return;
         saving = false;
         savingSnapshot = null;
+        savingBaseSnapshot = null;
         editorSaveVersion = SAVE_VERSION;
         if (success) {
             editorMode = false;
@@ -1018,6 +1492,8 @@ public final class MainActivity extends Activity {
         if (imageExecutor != null) imageExecutor.shutdown();
         if (selectedBitmap != null && !selectedBitmap.isRecycled()) selectedBitmap.recycle();
         savingSnapshot = null;
+        savingBaseSnapshot = null;
+        closeEditorLogos();
         super.onDestroy();
     }
 }
