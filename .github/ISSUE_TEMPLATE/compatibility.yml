@@ -1,0 +1,26 @@
+name: 兼容性问题
+description: 钱包未识别、卡面未发现或图片未替换
+body:
+  - type: input
+    id: model
+    attributes:
+      label: 手机型号和系统版本
+    validations:
+      required: true
+  - type: input
+    id: wallet
+    attributes:
+      label: 钱包版本 / LSPosed 版本 / 模块版本
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 操作步骤和实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 模块内复制的诊断
+      description: 不要附带卡号、密钥、卡片 dump 或私人图片。
